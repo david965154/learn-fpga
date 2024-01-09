@@ -30,7 +30,7 @@
 /*******************************************************************/
 
 // Firmware generation flags for this processor
-`define NRV_ARCH     "rv32i"
+`define NRV_ARCH     "rv32im"
 `define NRV_ABI      "ilp32"
 `define NRV_OPTIMIZE "-Os"
 
@@ -44,7 +44,6 @@ module FemtoRV32(
    output 	 mem_rstrb, // active to initiate memory read (used by IO)
    input 	 mem_rbusy, // asserted if memory is busy reading value
    input 	 mem_wbusy, // asserted if memory is busy writing value
-
    input 	 reset      // set to 0 to reset the processor
 );
 
@@ -79,14 +78,15 @@ module FemtoRV32(
    // Base RISC-V (RV32I) has only 10 different instructions !
    wire isLoad    =  (instr[6:2] == 5'b00000); // rd <- mem[rs1+Iimm]
    wire isALUimm  =  (instr[6:2] == 5'b00100); // rd <- rs1 OP Iimm
+   wire isAUIPC   =  (instr[6:2] == 5'b00101); // rd <- PC + Uimm
    wire isStore   =  (instr[6:2] == 5'b01000); // mem[rs1+Simm] <- rs2
    wire isALUreg  =  (instr[6:2] == 5'b01100); // rd <- rs1 OP rs2
-   wire isSYSTEM  =  (instr[6:2] == 5'b11100); // rd <- cycles
-   wire isJAL     =  instr[3]; // (instr[6:2] == 5'b11011); // rd <- PC+4; PC<-PC+Jimm
-   wire isJALR    =  (instr[6:2] == 5'b11001); // rd <- PC+4; PC<-rs1+Iimm
    wire isLUI     =  (instr[6:2] == 5'b01101); // rd <- Uimm
-   wire isAUIPC   =  (instr[6:2] == 5'b00101); // rd <- PC + Uimm
    wire isBranch  =  (instr[6:2] == 5'b11000); // if(rs1 OP rs2) PC<-PC+Bimm
+   wire isJALR    =  (instr[6:2] == 5'b11001); // rd <- PC+4; PC<-rs1+Iimm
+   // 因為只有JAL第三位為1
+   wire isJAL     =  instr[3]; // (instr[6:2] == 5'b11011); // rd <- PC+4; PC<-PC+Jimm
+   wire isSYSTEM  =  (instr[6:2] == 5'b11100); // rd <- cycles
 
    wire isALU = isALUimm | isALUreg;
 
@@ -96,7 +96,7 @@ module FemtoRV32(
 
    reg [31:0] rs1;
    reg [31:0] rs2;
-   
+   // 不檢查讀寫的合法性
    (* no_rw_check *)
    reg [31:0] registerFile [31:0];
 
@@ -118,10 +118,14 @@ module FemtoRV32(
    //    ALUimm, Load, JALR: Iimm
    wire [31:0] aluIn2 = isALUreg | isBranch ? rs2 : Iimm;
 
-   reg  [31:0] aluReg;       // The internal register of the ALU, used by shift.
-   reg  [4:0]  aluShamt;     // Current shift amount.
+   // 下面應為rv32i雖然沒乘法除法與餘數，但仍支援左右移，因此有以下3段
+   // Femtorv32_electron則有乘除可直接將左右移併入
+   // reg  [31:0] aluReg;       // The internal register of the ALU, used by shift.
+   // reg  [4:0]  aluShamt;     // Current shift amount.
 
-   wire aluBusy = |aluShamt; // ALU is busy if shift amount is non-zero.
+   // wire aluBusy = |aluShamt; // ALU is busy if shift amount is non-zero.
+   // ^^^^^^^^^^^^^^^^^^^^^^
+
    wire aluWr;               // ALU write strobe, starts shifting.
 
    // The adder is used by both arithmetic instructions and JALR.
@@ -134,49 +138,150 @@ module FemtoRV32(
    wire        LTU = aluMinus[32];
    wire        EQ  = (aluMinus[31:0] == 0);
 
+
+// 自此開始為rv32im所擁有的功能1.bit reversal 2.multiply 3.divide 4.quotient 同時包含原有的左右移
+   /***************************************************************************/
+
+   // Use the same shifter both for left and right shifts by 
+   // applying bit reversal
+
+   wire [31:0] shifter_in = funct3Is[1] ?
+     {aluIn1[ 0], aluIn1[ 1], aluIn1[ 2], aluIn1[ 3], aluIn1[ 4], aluIn1[ 5], 
+      aluIn1[ 6], aluIn1[ 7], aluIn1[ 8], aluIn1[ 9], aluIn1[10], aluIn1[11], 
+      aluIn1[12], aluIn1[13], aluIn1[14], aluIn1[15], aluIn1[16], aluIn1[17], 
+      aluIn1[18], aluIn1[19], aluIn1[20], aluIn1[21], aluIn1[22], aluIn1[23],
+      aluIn1[24], aluIn1[25], aluIn1[26], aluIn1[27], aluIn1[28], aluIn1[29], 
+      aluIn1[30], aluIn1[31]} : aluIn1;
+
+   // 這裡串接一個有號符，為了在左右移後不破壞正負號
+   // 小技巧:這裡先透過funct3Is[1]做判斷反轉與否，可以統一左右移至右移，如果是左移，則需反轉回來
+   // 後面有: funct3Is[1]  ? leftshift : 32'b0，不過instr[30] & aluIn1[31]所串接的位元不知道該如何處理
+   /* verilator lint_off WIDTH */
+   wire [31:0] shifter = 
+               $signed({instr[30] & aluIn1[31], shifter_in}) >>> aluIn2[4:0];
+   /* verilator lint_on WIDTH */
+
+   wire [31:0] leftshift = {
+     shifter[ 0], shifter[ 1], shifter[ 2], shifter[ 3], shifter[ 4], 
+     shifter[ 5], shifter[ 6], shifter[ 7], shifter[ 8], shifter[ 9], 
+     shifter[10], shifter[11], shifter[12], shifter[13], shifter[14], 
+     shifter[15], shifter[16], shifter[17], shifter[18], shifter[19], 
+     shifter[20], shifter[21], shifter[22], shifter[23], shifter[24], 
+     shifter[25], shifter[26], shifter[27], shifter[28], shifter[29], 
+     shifter[30], shifter[31]};
+
+   /***************************************************************************/
+
+   wire funcM     = instr[25];
+   wire isDivide  = isALUreg & funcM & instr[14]; // |funct3Is[7:4];
+   wire aluBusy   = |quotient_msk; // ALU is busy if division is in progress.
+
+   // funct3: 1->MULH, 2->MULHSU  3->MULHU
+   wire isMULH   = funct3Is[1];
+   wire isMULHSU = funct3Is[2];
+
+   wire sign1 = aluIn1[31] &  isMULH;
+   wire sign2 = aluIn2[31] & (isMULH | isMULHSU);
+
+   wire signed [32:0] signed1 = {sign1, aluIn1};
+   wire signed [32:0] signed2 = {sign2, aluIn2};
+   wire signed [63:0] multiply = aluIn1 * aluIn2;
+
+   /***************************************************************************/
+   // ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+
    // Notes:
    // - instr[30] is 1 for SUB and 0 for ADD
    // - for SUB, need to test also instr[5] to discriminate ADDI:
    //    (1 for ADD/SUB, 0 for ADDI, and Iimm used by ADDI overlaps bit 30 !)
    // - instr[30] is 1 for SRA (do sign extension) and 0 for SRL
 
-   wire [31:0] aluOut =
+   wire [31:0] aluOut_base =
      (funct3Is[0]  ? instr[30] & instr[5] ? aluMinus[31:0] : aluPlus : 32'b0) |
+     (funct3Is[1]  ? leftshift                                       : 32'b0) |
      (funct3Is[2]  ? {31'b0, LT}                                     : 32'b0) |
      (funct3Is[3]  ? {31'b0, LTU}                                    : 32'b0) |
      (funct3Is[4]  ? aluIn1 ^ aluIn2                                 : 32'b0) |
+     // 添加右移，即除法(原只支援SRL)，上面的block透過添加有號數功能以實作SRA
+     (funct3Is[5]  ? shifter                                         : 32'b0) |
      (funct3Is[6]  ? aluIn1 | aluIn2                                 : 32'b0) |
-     (funct3Is[7]  ? aluIn1 & aluIn2                                 : 32'b0) |
-     (funct3IsShift ? aluReg                                         : 32'b0) ;
+     (funct3Is[7]  ? aluIn1 & aluIn2                                 : 32'b0) ;
 
-   wire funct3IsShift = funct3Is[1] | funct3Is[5];
+   // multiply、divide and quotient 部分
+    wire [31:0] aluOut_muldiv =
+     (  funct3Is[0]   ?  multiply[31: 0] : 32'b0) | // 0:MUL
+     ( |funct3Is[3:1] ?  multiply[63:32] : 32'b0) | // 1:MULH, 2:MULHSU, 3:MULHU
+     (  instr[14]     ?  div_sign ? -divResult : divResult : 32'b0) ; 
+                                                 // 4:DIV, 5:DIVU, 6:REM, 7:REMU
+   
+   wire [31:0] aluOut = isALUreg & funcM ? aluOut_muldiv : aluOut_base;
+   // 實作商餘數功能
+   /***************************************************************************/
+   // Implementation of DIV/REM instructions, highly inspired by PicoRV32
+
+   reg [31:0] dividend;
+   reg [62:0] divisor;
+   reg [31:0] quotient;
+   reg [31:0] quotient_msk;
+
+   wire divstep_do = divisor <= {31'b0, dividend};
+
+   wire [31:0] dividendN     = divstep_do ? dividend - divisor[31:0] : dividend;
+   wire [31:0] quotientN     = divstep_do ? quotient | quotient_msk  : quotient;
+
+   wire div_sign = ~instr[12] & (instr[13] ? aluIn1[31] : 
+                    (aluIn1[31] != aluIn2[31]) & |aluIn2);
 
    always @(posedge clk) begin
-      if(aluWr) begin
-         if (funct3IsShift) begin  // SLL, SRA, SRL
-	    aluReg <= aluIn1;
-	    aluShamt <= aluIn2[4:0];
-	 end
-      end
-
-`ifdef NRV_TWOLEVEL_SHIFTER
-      else if(|aluShamt[4:2]) begin // Shift by 4
-         aluShamt <= aluShamt - 4;
-	 aluReg <= funct3Is[1] ? aluReg << 4 :
-		   {{4{instr[30] & aluReg[31]}}, aluReg[31:4]};
-      end  else
-`endif
-      // Compact form of:
-      // funct3=001              -> SLL  (aluReg <= aluReg << 1)
-      // funct3=101 &  instr[30] -> SRA  (aluReg <= {aluReg[31], aluReg[31:1]})
-      // funct3=101 & !instr[30] -> SRL  (aluReg <= {1'b0,       aluReg[31:1]})
-
-      if (|aluShamt) begin
-         aluShamt <= aluShamt - 1;
-	 aluReg <= funct3Is[1] ? aluReg << 1 :              // SLL
-		   {instr[30] & aluReg[31], aluReg[31:1]};  // SRA,SRL
+      if (isDivide & aluWr) begin
+	 dividend <=   ~instr[12] & aluIn1[31] ? -aluIn1 : aluIn1;
+	 divisor  <= {(~instr[12] & aluIn2[31] ? -aluIn2 : aluIn2), 31'b0};
+	 quotient <= 0;
+	 quotient_msk <= 1 << 31;
+      end else begin
+	 dividend     <= dividendN;
+	 divisor      <= divisor >> 1;
+	 quotient     <= quotientN;
+	 quotient_msk <= quotient_msk >> 1;
       end
    end
+      
+   reg  [31:0] divResult;
+   always @(posedge clk) divResult <= instr[13] ? dividendN : quotientN;
+
+
+// 下方同為左右移部分
+   //   (funct3IsShift ? aluReg                                         : 32'b0) ;
+
+//    wire funct3IsShift = funct3Is[1] | funct3Is[5];
+
+//    always @(posedge clk) begin
+//       if(aluWr) begin
+//          if (funct3IsShift) begin  // SLL, SRA, SRL
+// 	    aluReg <= aluIn1;
+// 	    aluShamt <= aluIn2[4:0];
+// 	 end
+//       end
+
+// `ifdef NRV_TWOLEVEL_SHIFTER
+//       else if(|aluShamt[4:2]) begin // Shift by 4
+//          aluShamt <= aluShamt - 4;
+// 	 aluReg <= funct3Is[1] ? aluReg << 4 :
+// 		   {{4{instr[30] & aluReg[31]}}, aluReg[31:4]};
+//       end  else
+// `endif
+//       // Compact form of:
+//       // funct3=001              -> SLL  (aluReg <= aluReg << 1)
+//       // funct3=101 &  instr[30] -> SRA  (aluReg <= {aluReg[31], aluReg[31:1]})
+//       // funct3=101 & !instr[30] -> SRL  (aluReg <= {1'b0,       aluReg[31:1]})
+
+//       if (|aluShamt) begin
+//          aluShamt <= aluShamt - 1;
+// 	 aluReg <= funct3Is[1] ? aluReg << 1 :              // SLL
+// 		   {instr[30] & aluReg[31], aluReg[31:1]};  // SRA,SRL
+//       end
+//    end
 
    /***************************************************************************/
    // The predicate for conditional branches.
@@ -189,7 +294,8 @@ module FemtoRV32(
         funct3Is[5] & !LT  | // BGE
         funct3Is[6] &  LTU | // BLTU
         funct3Is[7] & !LTU ; // BGEU
-
+        
+   // PC and Branch 指令
    /***************************************************************************/
    // Program counter and branch target computation.
    /***************************************************************************/
@@ -203,9 +309,9 @@ module FemtoRV32(
    // An adder used to compute branch address, JAL address and AUIPC.
    // branch->PC+Bimm    AUIPC->PC+Uimm    JAL->PC+Jimm
    // Equivalent to PCplusImm = PC + (isJAL ? Jimm : isAUIPC ? Uimm : Bimm)
-   wire [ADDR_WIDTH-1:0] PCplusImm = PC + ( instr[3] ? Jimm[ADDR_WIDTH-1:0] :
-					    instr[4] ? Uimm[ADDR_WIDTH-1:0] :
-					               Bimm[ADDR_WIDTH-1:0] );
+   wire [ADDR_WIDTH-1:0] PCplusImm = PC + (  instr[3] ? Jimm[ADDR_WIDTH-1:0] :
+                                             instr[4] ? Uimm[ADDR_WIDTH-1:0] :
+                                                        Bimm[ADDR_WIDTH-1:0] );
 
    // A separate adder to compute the destination of load/store.
    // testing instr[5] is equivalent to testing isStore in this context.
@@ -219,6 +325,18 @@ module FemtoRV32(
    assign mem_addr = state[WAIT_INSTR_bit] | state[FETCH_INSTR_bit] ?
 		     PC : loadstore_addr ;
 
+   // 應該是作者自己加的功能，可以做cycle數進行追蹤
+   /***************************************************************************/
+   // Counter.
+   /***************************************************************************/
+
+   reg  [63:0]           cycles;  // Cycle counter
+   always @(posedge clk) cycles <= cycles + 1;
+
+   wire sel_cyclesh = (instr[31:20] == 12'hC80);
+   wire [31:0] CSR_read = sel_cyclesh ? cycles[63:32] : cycles[31:0];
+
+   // WB
    /***************************************************************************/
    // The value written back to the register file.
    /***************************************************************************/
@@ -270,7 +388,7 @@ module FemtoRV32(
    assign mem_wdata[15: 8] = loadstore_addr[0] ? rs2[7:0]  : rs2[15: 8];
    assign mem_wdata[23:16] = loadstore_addr[1] ? rs2[7:0]  : rs2[23:16];
    assign mem_wdata[31:24] = loadstore_addr[0] ? rs2[7:0]  :
-			     loadstore_addr[1] ? rs2[15:8] : rs2[31:24];
+			                    loadstore_addr[1] ? rs2[15:8] : rs2[31:24];
 
    // The memory write mask:
    //    1111                     if writing a word
@@ -288,7 +406,7 @@ module FemtoRV32(
 	      mem_halfwordAccess ?
 	            (loadstore_addr[1] ? 4'b1100 : 4'b0011) :
               4'b1111;
-
+   // state machine 
    /*************************************************************************/
    // And, last but not least, the state machine.
    /*************************************************************************/
@@ -324,13 +442,27 @@ module FemtoRV32(
    assign aluWr = state[EXECUTE_bit] & isALU;
 
    wire jumpToPCplusImm = isJAL | (isBranch & predicate);
-`ifdef NRV_IS_IO_ADDR
-   wire needToWait = isLoad |
-		     isStore  & `NRV_IS_IO_ADDR(mem_addr) |
-		     isALU & funct3IsShift;
-`else
-   wire needToWait = isLoad | isStore | isALU & funct3IsShift;
-`endif
+
+// 因前面尚未定義NRV_IS_IO_ADDR，所以會直接跳else，因此會與Femtorv32_electron的部分相同
+// 但isALU & funct3IsShift改成isDivide
+
+// `ifdef NRV_IS_IO_ADDR
+//    wire needToWait = isLoad |
+// 		     isStore  & `NRV_IS_IO_ADDR(mem_addr) |
+// 		     isALU & funct3IsShift;
+// `else
+//    wire needToWait = isLoad | isStore | isALU & funct3IsShift;
+// `endif
+
+   // 自 Femtorv32_electron新增部分
+   wire needToWait = isLoad | isStore | isDivide;
+
+   // 這裡PC會有兩階段，先透過isJALR去決定長度為[ADDR_WIDTH-1:0]的PC_new，後面的always會再去處理PC
+   wire [ADDR_WIDTH-1:0] PC_new = 
+			 isJALR           ? {aluPlus[ADDR_WIDTH-1:1],1'b0} :
+                         jumpToPCplusImm  ? PCplusImm :
+                         PCplus4;
+   //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ 
 
    always @(posedge clk) begin
       if(!reset) begin
@@ -350,17 +482,24 @@ module FemtoRV32(
               state <= EXECUTE;         // also the declaration of instr).
            end
         end
-
-        state[EXECUTE_bit]: begin
-           PC <= isJALR          ? {aluPlus[ADDR_WIDTH-1:1],1'b0} :
-                 jumpToPCplusImm ? PCplusImm :
-                 PCplus4;
-	   state <= needToWait ? WAIT_ALU_OR_MEM : FETCH_INSTR;
-        end
+      // 原先是合併的，但Femtorv32_electron將其拆為兩部分，可能是因為長度不同所以需分開處理
+      //   state[EXECUTE_bit]: begin
+      //      PC <= isJALR          ? {aluPlus[ADDR_WIDTH-1:1],1'b0} :
+      //            jumpToPCplusImm ? PCplusImm :
+      //            PCplus4;
+	   //      state <= needToWait ? WAIT_ALU_OR_MEM : FETCH_INSTR;
+      //   end
 
         state[WAIT_ALU_OR_MEM_bit]: begin
            if(!aluBusy & !mem_rbusy & !mem_wbusy) state <= FETCH_INSTR;
         end
+
+        // 接續上面的PC_new去變更PC與state
+        state[EXECUTE_bit]: begin
+           PC <= PC_new;
+           state <= needToWait ? WAIT_ALU_OR_MEM : FETCH_INSTR;
+        end
+        //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
         default: begin // FETCH_INSTR
           state <= WAIT_INSTR;
@@ -372,18 +511,18 @@ module FemtoRV32(
    /***************************************************************************/
    // Cycle counter
    /***************************************************************************/
-
-`ifdef NRV_COUNTER_WIDTH
-   reg [`NRV_COUNTER_WIDTH-1:0]  cycles;
-`else
-   reg [31:0]  cycles;
-`endif
-   always @(posedge clk) cycles <= cycles + 1;
+// 這裡與Femtorv32_electron的類似，不過Femtorv32_electron是取64位再透過(instr[31:20] == 12'hC80)?去看要取前32位還是後32位
+// `ifdef NRV_COUNTER_WIDTH
+//    reg [`NRV_COUNTER_WIDTH-1:0]  cycles;
+// `else
+//    reg [31:0]  cycles;
+// `endif
+//    always @(posedge clk) cycles <= cycles + 1;
 
 `ifdef BENCH
    initial begin
       cycles = 0;
-      aluShamt = 0;
+      // aluShamt = 0;
       registerFile[0] = 0;
    end
 `endif
@@ -417,4 +556,5 @@ endmodule
 // [2] state uses 1-hot encoding (at any time, state has only one bit set to 1).
 // It uses a larger number of bits (one bit per state), but often results in
 // a both more compact (fewer LUTs) and faster state machine.
+
 
